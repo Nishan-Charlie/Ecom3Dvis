@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+opencv-python
+rembg[gpu]
+open3d
+trimesh
+pygltflib
+firebase-admin
+python-multipart
+websockets
+Pillow

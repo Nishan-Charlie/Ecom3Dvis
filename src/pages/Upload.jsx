@@ -6,8 +6,22 @@ import { useAuth } from '../hooks/useAuth'
 import { createListing, updateListing } from '../hooks/useListings'
 import FrameExtractor from '../components/FrameExtractor'
 import { reconstructTripoSR, reconstructGaussianSplatting } from '../lib/replicate'
+import { checkServerAvailable, startLocalReconstruction, connectJobSocket } from '../lib/localPipeline'
 
 const STEPS = ['Details', 'Video', 'Frames', 'Reconstruct', 'Done']
+
+const STAGE_LABELS = {
+  queued: 'Queued…',
+  extracting_frames: 'Extracting frames…',
+  removing_background: 'Removing background…',
+  estimating_cameras: 'Estimating camera poses…',
+  reconstructing: 'Running NeRF reconstruction…',
+  cleaning_mesh: 'Cleaning mesh…',
+  exporting: 'Exporting GLB…',
+  uploading: 'Uploading to Firebase…',
+  done: 'Done!',
+  failed: 'Failed',
+}
 
 const CATEGORIES = ['electronics', 'clothing', 'furniture', 'toys', 'books', 'ceramics']
 const CONDITIONS = [
@@ -18,8 +32,9 @@ const CONDITIONS = [
   { value: 'poor', label: 'Poor' },
 ]
 const RECON_METHODS = [
-  { value: 'triposr', label: 'TripoSR', desc: 'Fast (10–20s). Single best frame.' },
-  { value: '3dgs', label: '3D Gaussian Splatting', desc: 'High quality (1–3 min). Multi-view.' },
+  { value: 'triposr', label: 'TripoSR', desc: 'Fast (10–20s). Single best frame. Uses Replicate API.' },
+  { value: '3dgs', label: '3D Gaussian Splatting', desc: 'High quality (1–3 min). Multi-view. Uses Replicate API.' },
+  { value: 'local_gpu', label: 'Local GPU', desc: 'Full NeRF pipeline on your machine — 3–6 min. Run server.py first. No API costs.' },
 ]
 
 export default function Upload() {
@@ -45,6 +60,9 @@ export default function Upload() {
   const [reconProgress, setReconProgress] = useState(null)
   const [reconError, setReconError] = useState(null)
   const [listingId, setListingId] = useState(null)
+  // Local GPU pipeline extras
+  const [localStage, setLocalStage] = useState(null)
+  const [localProgressPct, setLocalProgressPct] = useState(0)
 
   if (!user || profile?.role !== 'seller') {
     return (
@@ -146,6 +164,86 @@ export default function Upload() {
       setReconError(err.message)
       setReconStatus('error')
       if (listingId) await updateListing(listingId, { status: 'failed' })
+    }
+  }
+
+  async function handleLocalReconstruct() {
+    if (!videoFile) return
+    setReconStatus('uploading')
+    setReconError(null)
+
+    const available = await checkServerAvailable()
+    if (!available) {
+      setReconError('Local server is not running. Start it with: python server.py')
+      setReconStatus('error')
+      return
+    }
+
+    let docId = null
+    try {
+      // 1. Create listing doc
+      const docRef = await createListing({
+        title: form.title,
+        description: form.description,
+        price: parseFloat(form.price),
+        category: form.category,
+        condition: form.condition,
+        sellerId: user.uid,
+        sellerName: profile.displayName,
+        reconstructionMethod: 'local_gpu',
+        samplingMode: null,
+        frameStats: null,
+      })
+      docId = docRef.id
+      setListingId(docRef.id)
+
+      // 2. Upload thumbnail from extracted frames (if available)
+      if (frames.length > 0) {
+        const thumbRef = ref(storage, `listings/${docRef.id}/thumbnail.jpg`)
+        await uploadBytes(thumbRef, frames[0].blob)
+        const thumbnailUrl = await getDownloadURL(thumbRef)
+        await updateListing(docRef.id, { thumbnailUrl })
+      }
+
+      // 3. Send video to local server and open WebSocket
+      setReconStatus('running')
+      setLocalStage('queued')
+      setLocalProgressPct(0)
+
+      await startLocalReconstruction({
+        videoFile,
+        productName: form.title,
+        sellerUid: user.uid,
+        listingId: docRef.id,
+      })
+
+      await new Promise((resolve, reject) => {
+        const ws = connectJobSocket(
+          docRef.id,
+          (update) => {
+            setLocalStage(update.stage)
+            setLocalProgressPct(update.progress ?? 0)
+            if (update.stage === 'done') {
+              ws.close()
+              resolve()
+            } else if (update.stage === 'failed') {
+              ws.close()
+              reject(new Error(update.error ?? 'Reconstruction failed on local server'))
+            }
+          },
+          (errMsg) => {
+            reject(new Error(errMsg))
+          }
+        )
+      })
+
+      setReconStatus('done')
+      setStep(4)
+    } catch (err) {
+      console.error(err)
+      setReconError(err.message)
+      setReconStatus('error')
+      if (docId) await updateListing(docId, { status: 'failed' })
     }
   }
 
@@ -360,10 +458,28 @@ export default function Upload() {
             ))}
           </div>
 
-          {reconStatus === 'running' && reconProgress && (
+          {/* Replicate API progress */}
+          {reconStatus === 'running' && method !== 'local_gpu' && reconProgress && (
             <div className="bg-gray-800 rounded-xl px-4 py-3 flex items-center gap-3">
               <div className="w-5 h-5 border-2 border-violet-500 border-t-transparent rounded-full animate-spin shrink-0" />
               <p className="text-sm text-gray-300 capitalize">{reconProgress.replace('_', ' ')}…</p>
+            </div>
+          )}
+
+          {/* Local GPU progress */}
+          {reconStatus === 'running' && method === 'local_gpu' && (
+            <div className="bg-gray-800 rounded-xl px-4 py-3 space-y-2">
+              <div className="flex items-center gap-3">
+                <div className="w-5 h-5 border-2 border-violet-500 border-t-transparent rounded-full animate-spin shrink-0" />
+                <p className="text-sm text-gray-300">{STAGE_LABELS[localStage] ?? 'Processing…'}</p>
+                <span className="ml-auto text-xs text-gray-500">{localProgressPct}%</span>
+              </div>
+              <div className="w-full h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-violet-500 rounded-full transition-all duration-500"
+                  style={{ width: `${localProgressPct}%` }}
+                />
+              </div>
             </div>
           )}
 
@@ -371,6 +487,13 @@ export default function Upload() {
             <div className="bg-red-900/30 border border-red-700 rounded-xl px-4 py-3 text-sm text-red-300">
               {reconError}
             </div>
+          )}
+
+          {method === 'local_gpu' && reconStatus === 'idle' && (
+            <p className="text-xs text-gray-500 bg-gray-800/60 border border-gray-700 rounded-xl px-3 py-2">
+              Make sure <span className="text-gray-300 font-mono">python server.py</span> is running in the
+              reconstruction-tool folder before clicking Generate.
+            </p>
           )}
 
           <div className="flex gap-3">
@@ -382,7 +505,7 @@ export default function Upload() {
               Back
             </button>
             <button
-              onClick={handleReconstruct}
+              onClick={method === 'local_gpu' ? handleLocalReconstruct : handleReconstruct}
               disabled={reconStatus === 'uploading' || reconStatus === 'running'}
               className="flex-1 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-xl transition-colors"
             >

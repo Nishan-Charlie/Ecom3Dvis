@@ -1,0 +1,6 @@
+{
+  "_instructions": "Replace this file with your Firebase service account key JSON. Download it from: Firebase Console > Project Settings > Service accounts > Generate new private key. Then add the storageBucket field below.",
+  "type": "TEMPLATE",
+  "project_id": "YOUR_PROJECT_ID",
+  "storageBucket": "YOUR_PROJECT_ID.firebasestorage.app"
+}
