@@ -1,12 +1,22 @@
 import { useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage'
+import { ref } from 'firebase/storage'
 import { storage } from '../lib/firebase'
+import { uploadBlobResumable } from '../lib/storageUpload'
 import { useAuth } from '../hooks/useAuth'
-import { createListing, updateListing } from '../hooks/useListings'
+import { newListingRef, commitListingDraft, updateListing, markListingReconstructionFailed } from '../hooks/useListings'
 import FrameExtractor from '../components/FrameExtractor'
-import { reconstructTripoSR, reconstructGaussianSplatting } from '../lib/replicate'
+
 import { checkServerAvailable, startLocalReconstruction, connectJobSocket } from '../lib/localPipeline'
+
+import {
+  createLocalReconJob,
+  pollLocalReconJob,
+  fetchReconModelGlbBlob,
+  MAX_MULTIVIEW_IMAGES,
+  selectViewsForMultiViewReconstruction,
+} from '../lib/localReconstruct'
+
 
 const STEPS = ['Details', 'Video', 'Frames', 'Reconstruct', 'Done']
 
@@ -32,15 +42,89 @@ const CONDITIONS = [
   { value: 'poor', label: 'Poor' },
 ]
 const RECON_METHODS = [
-  { value: 'triposr', label: 'TripoSR', desc: 'Fast (10–20s). Single best frame. Uses Replicate API.' },
-  { value: '3dgs', label: '3D Gaussian Splatting', desc: 'High quality (1–3 min). Multi-view. Uses Replicate API.' },
-  { value: 'local_gpu', label: 'Local GPU', desc: 'Full NeRF pipeline on your machine — 3–6 min. Run server.py first. No API costs.' },
+  {
+    value: 'single',
+    label: 'Single view (flat card)',
+    desc: 'One frame → textured quad in GLB. Looks 2D from the side; use only for a quick placeholder.',
+  },
+  {
+    value: 'multi',
+    label: 'Multi-view 3D (recommended)',
+    desc: `Up to ${MAX_MULTIVIEW_IMAGES} sharp, evenly spread frames → COLMAP + Poisson mesh GLB. Requires npm run recon + COLMAP.`,
+  },
+  {
+    value: 'local_gpu',
+    label: 'Local GPU (NeRF)',
+    desc: 'Full NeRF pipeline on your machine (python server.py on port 8000). 3–6 min, no API costs.',
+  },
 ]
+
+const MAX_VIDEO_BYTES = 120 * 1024 * 1024 // 120 MB
+const MAX_VIDEO_DURATION_SEC = 60
+const MAX_VIDEO_WIDTH = 1920
+const MAX_VIDEO_HEIGHT = 1080
+
+function readVideoMetadata(file) {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video')
+    const objectUrl = URL.createObjectURL(file)
+    video.preload = 'metadata'
+    video.onloadedmetadata = () => {
+      const metadata = {
+        duration: video.duration,
+        width: video.videoWidth,
+        height: video.videoHeight,
+      }
+      URL.revokeObjectURL(objectUrl)
+      resolve(metadata)
+    }
+    video.onerror = () => {
+      URL.revokeObjectURL(objectUrl)
+      reject(new Error('Unable to read video metadata. Please choose another video file.'))
+    }
+    video.src = objectUrl
+  })
+}
+
+/** Smaller uploads to Firebase Storage (full-res frames from canvas can be several MB). */
+async function compressJpegForUpload(blob, maxEdge = 1280, quality = 0.82) {
+  const url = URL.createObjectURL(blob)
+  try {
+    const img = new Image()
+    await new Promise((resolve, reject) => {
+      img.onload = () => resolve()
+      img.onerror = () => reject(new Error('Could not read thumbnail image'))
+      img.src = url
+    })
+    const w = img.naturalWidth || img.width
+    const h = img.naturalHeight || img.height
+    if (!w || !h) throw new Error('Invalid thumbnail dimensions')
+    const scale = Math.min(1, maxEdge / Math.max(w, h))
+    const tw = Math.max(1, Math.round(w * scale))
+    const th = Math.max(1, Math.round(h * scale))
+    const canvas = document.createElement('canvas')
+    canvas.width = tw
+    canvas.height = th
+    canvas.getContext('2d').drawImage(img, 0, 0, tw, th)
+    return new Promise((resolve, reject) => {
+      canvas.toBlob(
+        (b) => (b ? resolve(b) : reject(new Error('Thumbnail encode failed'))),
+        'image/jpeg',
+        quality,
+      )
+    })
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
 
 export default function Upload() {
   const { user, profile } = useAuth()
   const navigate = useNavigate()
   const videoInputRef = useRef()
+
+  const sellerDisplayName =
+    profile?.displayName || user?.displayName || user?.email?.split('@')[0] || 'Seller'
 
   const [step, setStep] = useState(0)
 
@@ -50,120 +134,207 @@ export default function Upload() {
   // Step 1 — video
   const [videoFile, setVideoFile] = useState(null)
   const [videoPreview, setVideoPreview] = useState(null)
+  const [videoError, setVideoError] = useState('')
 
   // Step 2 — frames
   const [frames, setFrames] = useState([])
 
-  // Step 3 — reconstruct
-  const [method, setMethod] = useState('triposr')
+  // Step 3 — reconstruct (default multi-view when you have orbited the object)
+  const [methodChoice, setMethodChoice] = useState('multi')
+  /** Single frame can only run the billboard path; otherwise use the user's choice. */
+  const method = frames.length < 2 ? 'single' : methodChoice
+
   const [reconStatus, setReconStatus] = useState('idle') // idle | uploading | running | done | error
   const [reconProgress, setReconProgress] = useState(null)
+  const [reconPhaseLabel, setReconPhaseLabel] = useState('')
   const [reconError, setReconError] = useState(null)
   const [listingId, setListingId] = useState(null)
   // Local GPU pipeline extras
   const [localStage, setLocalStage] = useState(null)
   const [localProgressPct, setLocalProgressPct] = useState(0)
 
-  if (!user || profile?.role !== 'seller') {
-    return (
-      <div className="flex-1 flex items-center justify-center flex-col gap-3 px-6 text-center">
-        <p className="text-gray-300 text-lg">You need a seller account to list items.</p>
-        <a href="/auth?mode=register&role=seller" className="text-violet-400 hover:underline">Create a seller account</a>
-      </div>
-    )
-  }
-
-  function handleVideoSelect(e) {
+  async function handleVideoSelect(e) {
     const file = e.target.files?.[0]
     if (!file) return
-    setVideoFile(file)
-    setVideoPreview(URL.createObjectURL(file))
+    setVideoError('')
     setFrames([])
+
+    if (file.size > MAX_VIDEO_BYTES) {
+      setVideoFile(null)
+      if (videoPreview) URL.revokeObjectURL(videoPreview)
+      setVideoPreview(null)
+      setVideoError(`Video is too large (${(file.size / (1024 * 1024)).toFixed(1)} MB). Use a file under 120 MB.`)
+      return
+    }
+
+    try {
+      const metadata = await readVideoMetadata(file)
+
+      if (metadata.duration > MAX_VIDEO_DURATION_SEC) {
+        setVideoFile(null)
+        if (videoPreview) URL.revokeObjectURL(videoPreview)
+        setVideoPreview(null)
+        setVideoError(`Video is too long (${Math.round(metadata.duration)}s). Use a video under 60 seconds.`)
+        return
+      }
+
+      if (metadata.width > MAX_VIDEO_WIDTH || metadata.height > MAX_VIDEO_HEIGHT) {
+        setVideoFile(null)
+        if (videoPreview) URL.revokeObjectURL(videoPreview)
+        setVideoPreview(null)
+        setVideoError(`Video resolution is ${metadata.width}x${metadata.height}. Use up to 1920x1080 for reliable extraction.`)
+        return
+      }
+
+      if (videoPreview) URL.revokeObjectURL(videoPreview)
+      setVideoFile(file)
+      setVideoPreview(URL.createObjectURL(file))
+    } catch (err) {
+      setVideoFile(null)
+      if (videoPreview) URL.revokeObjectURL(videoPreview)
+      setVideoPreview(null)
+      setVideoError(err.message || 'Invalid video file.')
+    }
   }
 
   async function handleReconstruct() {
     if (!frames.length) return
-    setReconStatus('uploading')
+    if (method === 'multi' && frames.length < 2) {
+      setReconError('Multi-view reconstruction needs at least two frames. Extract more frames or use single view.')
+      return
+    }
     setReconError(null)
+    setReconProgress(null)
 
+    let createdListingId = null
     try {
-      // 1. Create listing doc in Firestore
-      const docRef = await createListing({
+      const listingRef = newListingRef()
+      createdListingId = listingRef.id
+      setListingId(listingRef.id)
+
+      const viewsUsed =
+        method === 'single' ? 1 : selectViewsForMultiViewReconstruction(frames, MAX_MULTIVIEW_IMAGES).length
+
+      const reconstructionMethod = method === 'single' ? 'single' : '3dgs'
+
+      await commitListingDraft(listingRef, {
         title: form.title,
         description: form.description,
         price: parseFloat(form.price),
         category: form.category,
         condition: form.condition,
         sellerId: user.uid,
-        sellerName: profile.displayName,
+        sellerName: sellerDisplayName,
         samplingMode: null,
-        reconstructionMethod: method,
-        frameStats: null,
+        reconstructionMethod,
+        status: 'processing',
+        frameStats: {
+          total: frames.length,
+          accepted: frames.length,
+          usedForReconstruction: viewsUsed,
+          blurThreshold: 100,
+        },
       })
-      setListingId(docRef.id)
 
-      // 2. Upload thumbnail (first accepted frame)
-      const thumbRef = ref(storage, `listings/${docRef.id}/thumbnail.jpg`)
-      await uploadBytes(thumbRef, frames[0].blob)
-      const thumbnailUrl = await getDownloadURL(thumbRef)
-      await updateListing(docRef.id, { thumbnailUrl })
-
-      // 3. Upload frames for 3DGS (if needed)
-      let imageUrls = []
-      if (method === '3dgs') {
-        setReconStatus('uploading')
-        imageUrls = await Promise.all(
-          frames.map(async (f, i) => {
-            const fr = ref(storage, `listings/${docRef.id}/frames/frame_${i}.jpg`)
-            await uploadBytes(fr, f.blob)
-            return getDownloadURL(fr)
-          })
-        )
-      }
-
-      // 4. Call Replicate API
-      setReconStatus('running')
       const startMs = Date.now()
+      setReconStatus('running')
+      setReconPhaseLabel(
+        method === 'single'
+          ? 'Running local reconstruction (single view)…'
+          : 'Running local COLMAP + mesh (this can take several minutes)…',
+      )
 
-      let output
-      if (method === 'triposr') {
-        // Convert blob to data URL for TripoSR
-        const reader = new FileReader()
-        const dataUrl = await new Promise((res) => {
-          reader.onloadend = () => res(reader.result)
-          reader.readAsDataURL(frames[0].blob)
-        })
-        output = await reconstructTripoSR(dataUrl, (pred) => {
-          setReconProgress(pred.status)
-        })
+      const formData = new FormData()
+      formData.append('mode', method === 'single' ? 'single' : 'multi')
+
+      if (method === 'single') {
+        const jpeg = await compressJpegForUpload(frames[0].blob, 1280, 0.85)
+        formData.append('images', new File([jpeg], 'frame_0.jpg', { type: 'image/jpeg' }))
       } else {
-        output = await reconstructGaussianSplatting(imageUrls, (pred) => {
-          setReconProgress(pred.status)
-        })
+        const views = selectViewsForMultiViewReconstruction(frames, MAX_MULTIVIEW_IMAGES)
+        setReconPhaseLabel(
+          views.length < frames.length
+            ? `Using ${views.length} of ${frames.length} evenly spaced views for COLMAP…`
+            : `Using ${views.length} views for COLMAP…`,
+        )
+        for (let i = 0; i < views.length; i++) {
+          const jpeg = await compressJpegForUpload(views[i].blob, 1280, 0.82)
+          formData.append('images', new File([jpeg], `frame_${i}.jpg`, { type: 'image/jpeg' }))
+        }
       }
 
+      const { jobId } = await createLocalReconJob(formData)
+      await pollLocalReconJob(jobId, (status) => {
+        setReconProgress(status)
+        setReconPhaseLabel(
+          status === 'queued'
+            ? 'Job queued on local server…'
+            : status === 'preparing'
+              ? 'Saving images on server…'
+              : status === 'running'
+                ? method === 'single'
+                  ? 'Building textured billboard mesh…'
+                  : 'COLMAP + Poisson mesh (see server log if this stalls)…'
+                : status,
+        )
+      })
+
+      const glbBlob = await fetchReconModelGlbBlob(jobId)
       const processingTimeMs = Date.now() - startMs
 
-      // 5. Save model URL and metadata to Firestore
-      const modelUrl = Array.isArray(output) ? output[0] : output
-      await updateListing(docRef.id, {
+      setReconStatus('uploading')
+      setReconProgress(null)
+      setReconPhaseLabel('Uploading thumbnail and GLB to Storage…')
+
+      let thumbnailUrl = ''
+      try {
+        const thumbBlob = await compressJpegForUpload(frames[0].blob, 800, 0.72)
+        const thumbRef = ref(storage, `listings/${listingRef.id}/thumbnail.jpg`)
+        thumbnailUrl = await uploadBlobResumable(thumbRef, thumbBlob, {
+          timeoutMs: 600000,
+          onProgress: (pct) => setReconPhaseLabel(`Uploading thumbnail… ${pct}%`),
+        })
+      } catch (thumbErr) {
+        console.error(thumbErr)
+        setReconPhaseLabel('Thumbnail upload failed — continuing with model only.')
+      }
+
+      const modelRef = ref(storage, `listings/${listingRef.id}/model.glb`)
+      const modelUrl = await uploadBlobResumable(modelRef, glbBlob, {
+        contentType: 'model/gltf-binary',
+        timeoutMs: 600000,
+        onProgress: (pct) => setReconPhaseLabel(`Uploading GLB… ${pct}%`),
+      })
+
+      setReconPhaseLabel('Saving listing…')
+      await updateListing(listingRef.id, {
+        ...(thumbnailUrl ? { thumbnailUrl } : {}),
         modelUrl,
         status: 'ready',
         processingTimeMs,
         frameStats: {
           total: frames.length,
           accepted: frames.length,
+          usedForReconstruction: viewsUsed,
           blurThreshold: 100,
         },
       })
 
+      setReconPhaseLabel('')
       setReconStatus('done')
       setStep(4)
     } catch (err) {
       console.error(err)
+      setReconPhaseLabel('')
       setReconError(err.message)
       setReconStatus('error')
-      if (listingId) await updateListing(listingId, { status: 'failed' })
+      if (createdListingId) {
+        try {
+          await markListingReconstructionFailed(createdListingId, err.message || String(err))
+        } catch {
+          /* Firestore update may fail if the processing doc was never written */
+        }
+      }
     }
   }
 
@@ -181,31 +352,33 @@ export default function Upload() {
 
     let docId = null
     try {
-      // 1. Create listing doc
-      const docRef = await createListing({
+      const listingRef = newListingRef()
+      docId = listingRef.id
+      setListingId(listingRef.id)
+
+      await commitListingDraft(listingRef, {
         title: form.title,
         description: form.description,
         price: parseFloat(form.price),
         category: form.category,
         condition: form.condition,
         sellerId: user.uid,
-        sellerName: profile.displayName,
+        sellerName: sellerDisplayName,
         reconstructionMethod: 'local_gpu',
         samplingMode: null,
-        frameStats: null,
+        frameStats: frames.length
+          ? { total: frames.length, accepted: frames.length, usedForReconstruction: frames.length, blurThreshold: 70 }
+          : null,
+        status: 'processing',
       })
-      docId = docRef.id
-      setListingId(docRef.id)
 
-      // 2. Upload thumbnail from extracted frames (if available)
       if (frames.length > 0) {
-        const thumbRef = ref(storage, `listings/${docRef.id}/thumbnail.jpg`)
-        await uploadBytes(thumbRef, frames[0].blob)
-        const thumbnailUrl = await getDownloadURL(thumbRef)
-        await updateListing(docRef.id, { thumbnailUrl })
+        const thumbBlob = await compressJpegForUpload(frames[0].blob, 800, 0.72)
+        const thumbRef = ref(storage, `listings/${listingRef.id}/thumbnail.jpg`)
+        const thumbnailUrl = await uploadBlobResumable(thumbRef, thumbBlob, { timeoutMs: 600000 })
+        await updateListing(listingRef.id, { thumbnailUrl })
       }
 
-      // 3. Send video to local server and open WebSocket
       setReconStatus('running')
       setLocalStage('queued')
       setLocalProgressPct(0)
@@ -214,12 +387,12 @@ export default function Upload() {
         videoFile,
         productName: form.title,
         sellerUid: user.uid,
-        listingId: docRef.id,
+        listingId: listingRef.id,
       })
 
       await new Promise((resolve, reject) => {
         const ws = connectJobSocket(
-          docRef.id,
+          listingRef.id,
           (update) => {
             setLocalStage(update.stage)
             setLocalProgressPct(update.progress ?? 0)
@@ -362,6 +535,7 @@ export default function Upload() {
               <li>Steady movement, plain background</li>
               <li>Good lighting — avoid reflections and shadows</li>
               <li>Keep the item centred throughout</li>
+              <li>Use up to 1080p, under 60s, and below 120 MB</li>
             </ul>
           </div>
 
@@ -370,7 +544,14 @@ export default function Upload() {
             onClick={() => videoInputRef.current?.click()}
           >
             {videoPreview ? (
-              <video src={videoPreview} className="max-h-48 mx-auto rounded-xl" controls />
+              <video
+                src={videoPreview}
+                className="max-h-48 mx-auto rounded-xl"
+                controls
+                controlsList="nodownload noremoteplayback"
+                disablePictureInPicture
+                onContextMenu={(e) => e.preventDefault()}
+              />
             ) : (
               <div className="space-y-2">
                 <svg className="w-12 h-12 mx-auto text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -382,6 +563,12 @@ export default function Upload() {
             )}
             <input ref={videoInputRef} type="file" accept="video/*" onChange={handleVideoSelect} className="hidden" />
           </div>
+
+          {videoError && (
+            <p className="text-red-300 text-sm bg-red-900/20 border border-red-800 rounded-xl px-3 py-2">
+              {videoError}
+            </p>
+          )}
 
           <div className="flex gap-3">
             <button onClick={() => setStep(0)} className="flex-1 bg-gray-800 hover:bg-gray-700 text-white py-3 rounded-xl transition-colors">Back</button>
@@ -401,7 +588,7 @@ export default function Upload() {
         <div className="space-y-4">
           <h2 className="text-lg font-semibold text-white">Extract Frames</h2>
           <p className="text-sm text-gray-400">
-            ffmpeg.wasm runs in your browser to extract frames and filter blurry ones using Laplacian variance.
+            Frames are sampled in your browser with the built-in video decoder (fast), then filtered for blur using Laplacian variance.
           </p>
           <FrameExtractor
             videoFile={videoFile}
@@ -439,18 +626,30 @@ export default function Upload() {
       {step === 3 && (
         <div className="space-y-4">
           <h2 className="text-lg font-semibold text-white">3D Reconstruction</h2>
-          <p className="text-sm text-gray-400">Choose a reconstruction method and generate the 3D model.</p>
+          <p className="text-sm text-gray-400">
+            Choose a reconstruction method and generate the 3D model. You have{' '}
+            <span className="text-violet-300 font-medium">{frames.length}</span> sharp frame
+            {frames.length !== 1 ? 's' : ''} from the video.
+            {frames.length >= 2 && method === 'multi' && (
+              <span className="block mt-1 text-gray-500">
+                Multi-view will send up to {Math.min(frames.length, MAX_MULTIVIEW_IMAGES)} evenly spaced views to the
+                server.
+              </span>
+            )}
+          </p>
 
           <div className="grid gap-3">
             {RECON_METHODS.map((m) => (
               <button
                 key={m.value}
-                onClick={() => setMethod(m.value)}
+                type="button"
+                onClick={() => setMethodChoice(m.value)}
+                disabled={m.value === 'multi' && frames.length < 2}
                 className={`p-4 rounded-xl border text-left transition-all ${
                   method === m.value
                     ? 'border-violet-500 bg-violet-500/10'
                     : 'border-gray-700 bg-gray-800 hover:border-gray-600'
-                }`}
+                } ${m.value === 'multi' && frames.length < 2 ? 'opacity-50 cursor-not-allowed' : ''}`}
               >
                 <p className={`font-medium text-sm ${method === m.value ? 'text-violet-300' : 'text-white'}`}>{m.label}</p>
                 <p className="text-xs text-gray-500 mt-0.5">{m.desc}</p>
@@ -458,7 +657,13 @@ export default function Upload() {
             ))}
           </div>
 
-          {/* Replicate API progress */}
+
+          {(reconStatus === 'uploading' || reconStatus === 'running') && reconPhaseLabel && (
+            <div className="bg-gray-800/80 border border-gray-700 rounded-xl px-4 py-3 text-sm text-gray-300">
+              {reconPhaseLabel}
+            </div>
+          )}
+
           {reconStatus === 'running' && method !== 'local_gpu' && reconProgress && (
             <div className="bg-gray-800 rounded-xl px-4 py-3 flex items-center gap-3">
               <div className="w-5 h-5 border-2 border-violet-500 border-t-transparent rounded-full animate-spin shrink-0" />

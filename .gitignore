@@ -7,10 +7,16 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Secrets — keep .env on disk; Git will not track or delete it
+.env
+.env.*
+!.env.example
+
 node_modules
 dist
 dist-ssr
 *.local
+scripts/.storage-cors.generated.json
 
 # Editor directories and files
 .vscode/*
@@ -22,3 +28,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local 3DGS jobs (Flask backend)
+backend/jobs/
+backend/.venv/
+

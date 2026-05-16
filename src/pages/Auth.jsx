@@ -2,10 +2,37 @@ import { useState, useEffect } from 'react'
 import { useNavigate, useSearchParams, Link } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
 
+function getAuthErrorMessage(err) {
+  const code = err?.code || ''
+  const projectId = import.meta.env.VITE_FIREBASE_PROJECT_ID || 'unknown-project'
+
+  switch (code) {
+    case 'auth/operation-not-allowed':
+      return `Email/Password sign-in is disabled for Firebase project "${projectId}". Enable it in Firebase Console > Authentication > Sign-in method.`
+    case 'auth/email-already-in-use':
+      return 'This email is already in use. Try signing in instead.'
+    case 'auth/invalid-credential':
+    case 'auth/wrong-password':
+    case 'auth/user-not-found':
+      return 'Invalid email or password.'
+    case 'auth/weak-password':
+      return 'Password is too weak. Use at least 6 characters.'
+    case 'auth/invalid-email':
+      return 'Please enter a valid email address.'
+    case 'auth/too-many-requests':
+      return 'Too many attempts. Please wait a moment and try again.'
+    case 'auth/network-request-failed':
+      return 'Network error. Check your internet connection and try again.'
+    default:
+      return (err?.message || 'Authentication failed. Please try again.').replace('Firebase: ', '')
+  }
+}
+
 export default function Auth() {
   const [params] = useSearchParams()
   const [mode, setMode] = useState(params.get('mode') === 'register' ? 'register' : 'login')
   const [role, setRole] = useState(params.get('role') === 'seller' ? 'seller' : 'buyer')
+  const nextPath = params.get('next') || '/'
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [displayName, setDisplayName] = useState('')
@@ -16,8 +43,8 @@ export default function Auth() {
   const navigate = useNavigate()
 
   useEffect(() => {
-    if (user) navigate('/')
-  }, [user, navigate])
+    if (user) navigate(nextPath)
+  }, [user, navigate, nextPath])
 
   async function handleSubmit(e) {
     e.preventDefault()
@@ -29,9 +56,9 @@ export default function Auth() {
       } else {
         await login(email, password)
       }
-      navigate('/')
+      navigate(nextPath)
     } catch (err) {
-      setError(err.message.replace('Firebase: ', ''))
+      setError(getAuthErrorMessage(err))
     } finally {
       setLoading(false)
     }

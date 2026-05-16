@@ -50,6 +50,16 @@ export default function ProductDetail() {
       <div className="grid md:grid-cols-2 gap-8 lg:gap-12">
         {/* 3D Viewer / Thumbnail */}
         <div className="space-y-3">
+          {listing.status === 'failed' && listing.reconstructionError && (
+            <div className="rounded-xl border border-red-800/60 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+              <p className="font-semibold text-red-100 mb-1">3D reconstruction failed</p>
+              <p className="text-xs text-red-200/90 whitespace-pre-wrap break-words">{listing.reconstructionError}</p>
+              <p className="text-xs text-gray-500 mt-2">
+                Check Flask terminal logs, <code className="text-gray-400">backend/jobs/&lt;jobId&gt;/pipeline.log</code>, and
+                that <code className="text-gray-400">npm run recon</code> is running. Multi-view needs COLMAP.
+              </p>
+            </div>
+          )}
           {listing.modelUrl ? (
             <Viewer3D modelUrl={listing.modelUrl} className="w-full aspect-square" />
           ) : listing.thumbnailUrl ? (
@@ -64,7 +74,16 @@ export default function ProductDetail() {
           {listing.reconstructionMethod && (
             <div className="flex items-center gap-2 text-xs text-gray-500 justify-center">
               <span className="w-2 h-2 rounded-full bg-emerald-500" />
-              3D via {listing.reconstructionMethod === 'triposr' ? 'TripoSR' : '3D Gaussian Splatting'}
+              3D via{' '}
+              {listing.reconstructionMethod === 'single'
+                ? 'single-frame preview (flat)'
+                : listing.reconstructionMethod === 'multi'
+                  ? 'multi-view mesh (COLMAP)'
+                  : listing.reconstructionMethod === '3dgs'
+                    ? 'multi-view 3D mesh (COLMAP + Poisson)'
+                    : listing.reconstructionMethod === 'triposr'
+                      ? 'TripoSR (legacy)'
+                      : String(listing.reconstructionMethod)}
               {listing.samplingMode && (
                 <span>· {listing.samplingMode} sampling</span>
               )}

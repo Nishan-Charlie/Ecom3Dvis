@@ -6,19 +6,19 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "lint": "eslint .",
-    "preview": "vite preview"
+    "lint": "node --max-old-space-size=8192 ./node_modules/eslint/bin/eslint.js .",
+    "preview": "vite preview",
+    "recon": "node scripts/run-recon-backend.mjs",
+    "storage:set-cors": "node scripts/apply-storage-cors.mjs"
   },
   "dependencies": {
-    "@ffmpeg/ffmpeg": "^0.12.15",
-    "@ffmpeg/util": "^0.12.2",
+    "@google/model-viewer": "^4.2.0",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.6.0",
     "firebase": "^12.12.1",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "react-router-dom": "^7.14.2",
-    "replicate": "^1.4.0",
     "three": "^0.184.0"
   },
   "devDependencies": {

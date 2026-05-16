@@ -40,6 +40,9 @@ export default function Navbar() {
             >
               Sign Out
             </button>
+            <span className="hidden md:inline text-xs text-gray-400 max-w-44 truncate" title={user.email || ''}>
+              {user.email}
+            </span>
             <div className="w-8 h-8 rounded-full bg-violet-700 flex items-center justify-center text-sm font-semibold text-white">
               {(profile?.displayName || user.email)?.[0]?.toUpperCase()}
             </div>

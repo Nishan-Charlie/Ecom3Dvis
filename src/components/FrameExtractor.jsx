@@ -1,16 +1,19 @@
-import { useState, useCallback } from 'react'
-import { FFmpeg } from '@ffmpeg/ffmpeg'
-import { fetchFile, toBlobURL } from '@ffmpeg/util'
+import { useState, useRef, useEffect } from 'react'
 
 // Sampling mode definitions (RQ2: frame density comparison)
-export const SAMPLING_MODES = {
+const SAMPLING_MODES = {
   dense: { fps: 5, label: 'Dense (5 fps)', description: 'Most frames, best coverage' },
   medium: { fps: 2, label: 'Medium (2 fps)', description: 'Balanced quality/speed' },
   sparse: { fps: 1, label: 'Sparse (1 fps)', description: 'Fewest frames, fastest' },
 }
 
-// Laplacian variance blur detection (OpenCV.js approach replicated in JS)
-// Returns variance of Laplacian approximated via convolution
+/** Caps cost: native decode is fast; these limit work per clip. */
+const SAMPLE_CAPS = {
+  dense: { maxWidth: 960, maxFrames: 120 },
+  medium: { maxWidth: 960, maxFrames: 80 },
+  sparse: { maxWidth: 854, maxFrames: 55 },
+}
+
 function laplacianVariance(imageData) {
   const { data, width, height } = imageData
   const kernel = [0, 1, 0, 1, -4, 1, 0, 1, 0]
@@ -42,115 +45,221 @@ function isSharp(imageData, threshold = 100) {
   return laplacianVariance(imageData) >= threshold
 }
 
-async function getImageData(blob) {
-  return new Promise((resolve) => {
-    const img = new Image()
-    const url = URL.createObjectURL(blob)
-    img.onload = () => {
-      // Downscale for speed (128×128 is enough for blur detection)
-      const canvas = document.createElement('canvas')
-      canvas.width = 128
-      canvas.height = 128
-      const ctx = canvas.getContext('2d')
-      ctx.drawImage(img, 0, 0, 128, 128)
-      resolve(ctx.getImageData(0, 0, 128, 128))
-      URL.revokeObjectURL(url)
+function seekVideo(video, time) {
+  const duration = video.duration
+  if (!Number.isFinite(duration) || duration <= 0) {
+    return Promise.reject(new Error('Invalid video duration'))
+  }
+  const target = Math.min(Math.max(0, time), Math.max(0, duration - 1e-3))
+  return new Promise((resolve, reject) => {
+    if (Math.abs(video.currentTime - target) < 0.02) {
+      requestAnimationFrame(() => resolve())
+      return
     }
-    img.src = url
+    const onSeeked = () => {
+      video.removeEventListener('seeked', onSeeked)
+      video.removeEventListener('error', onErr)
+      resolve()
+    }
+    const onErr = () => {
+      video.removeEventListener('seeked', onSeeked)
+      video.removeEventListener('error', onErr)
+      reject(new Error('Video seek failed'))
+    }
+    video.addEventListener('seeked', onSeeked, { once: true })
+    video.addEventListener('error', onErr, { once: true })
+    video.currentTime = target
   })
 }
 
-let ffmpegInstance = null
-
-async function getFFmpeg(onLog) {
-  if (ffmpegInstance) return ffmpegInstance
-  const ff = new FFmpeg()
-  ff.on('log', ({ message }) => onLog?.(message))
-  await ff.load({
-    coreURL: await toBlobURL('https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js', 'text/javascript'),
-    wasmURL: await toBlobURL('https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.wasm', 'application/wasm'),
+function canvasToJpegBlob(canvas, quality) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error('Could not encode frame as JPEG'))),
+      'image/jpeg',
+      quality,
+    )
   })
-  ffmpegInstance = ff
-  return ff
+}
+
+/**
+ * Sample frames using the browser video decoder + canvas (hardware-backed).
+ * Much faster than ffmpeg.wasm for typical MP4/WebM.
+ */
+async function sampleFramesFromVideo(videoFile, { fps, maxFrames, maxWidth, blurThreshold, onProgress }) {
+  const objectUrl = URL.createObjectURL(videoFile)
+  const video = document.createElement('video')
+  video.src = objectUrl
+  video.muted = true
+  video.playsInline = true
+  video.preload = 'auto'
+
+  await new Promise((resolve, reject) => {
+    const ok = () => {
+      video.removeEventListener('loadedmetadata', ok)
+      video.removeEventListener('error', bad)
+      resolve()
+    }
+    const bad = () => {
+      video.removeEventListener('loadedmetadata', ok)
+      video.removeEventListener('error', bad)
+      reject(new Error('Could not load video. Use MP4 (H.264) or WebM that plays in this browser.'))
+    }
+    if (video.readyState >= 1) queueMicrotask(ok)
+    else {
+      video.addEventListener('loadedmetadata', ok, { once: true })
+      video.addEventListener('error', bad, { once: true })
+    }
+  })
+
+  const duration = video.duration
+  if (!Number.isFinite(duration) || duration <= 0) {
+    URL.revokeObjectURL(objectUrl)
+    throw new Error('Could not read video duration.')
+  }
+
+  const vw = video.videoWidth
+  const vh = video.videoHeight
+  if (!vw || !vh) {
+    URL.revokeObjectURL(objectUrl)
+    throw new Error('Could not read video dimensions.')
+  }
+
+  const scale = Math.min(1, maxWidth / vw)
+  const cw = Math.max(1, Math.round(vw * scale))
+  const ch = Math.max(1, Math.round(vh * scale))
+  const canvas = document.createElement('canvas')
+  canvas.width = cw
+  canvas.height = ch
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+
+  const thumb = document.createElement('canvas')
+  thumb.width = 128
+  thumb.height = 128
+  const tctx = thumb.getContext('2d', { willReadFrequently: true })
+
+  const interval = 1 / fps
+  const planned = Math.ceil(duration * fps)
+  const totalSamples = Math.min(maxFrames, planned)
+
+  const accepted = []
+  const rejectedNames = []
+
+  try {
+    for (let i = 0; i < totalSamples; i++) {
+      const sampleT = Math.min(duration - 1e-3, i * interval)
+      await seekVideo(video, sampleT)
+      ctx.drawImage(video, 0, 0, cw, ch)
+      tctx.drawImage(canvas, 0, 0, 128, 128)
+      const imageData = tctx.getImageData(0, 0, 128, 128)
+      const sharp = isSharp(imageData, blurThreshold)
+      const name = `frame_${String(i + 1).padStart(4, '0')}.jpg`
+
+      if (sharp) {
+        const blob = await canvasToJpegBlob(canvas, 0.88)
+        accepted.push({ name, blob, dataUrl: URL.createObjectURL(blob) })
+      } else {
+        rejectedNames.push(name)
+      }
+
+      onProgress?.(Math.round(((i + 1) / totalSamples) * 100))
+      if (i % 2 === 0) await new Promise((r) => requestAnimationFrame(r))
+    }
+  } finally {
+    URL.revokeObjectURL(objectUrl)
+    video.removeAttribute('src')
+    video.load()
+  }
+
+  return {
+    total: totalSamples,
+    accepted,
+    rejected: rejectedNames.length,
+  }
 }
 
 export default function FrameExtractor({ videoFile, onFramesReady }) {
-  const [mode, setMode] = useState('medium')
-  const [blurThreshold, setBlurThreshold] = useState(100)
-  const [status, setStatus] = useState('idle') // idle | loading_ffmpeg | extracting | filtering | done | error
+  const [mode, setMode] = useState('dense')
+  const [blurThreshold, setBlurThreshold] = useState(70)
+  const [status, setStatus] = useState('idle') // idle | preparing | extracting | done | error
   const [progress, setProgress] = useState(0)
-  const [log, setLog] = useState('')
+  const [lastError, setLastError] = useState('')
   const [stats, setStats] = useState(null)
+  const [statusHint, setStatusHint] = useState('')
+  const [elapsedSec, setElapsedSec] = useState(0)
+  const longWorkRef = useRef(null)
+  const workStartedAtRef = useRef(0)
 
-  const addLog = useCallback((msg) => setLog((l) => `${l}\n${msg}`), [])
+  const workInProgress = status === 'preparing' || status === 'extracting'
+
+  useEffect(() => {
+    if (!workInProgress) {
+      if (longWorkRef.current) {
+        clearInterval(longWorkRef.current)
+        longWorkRef.current = null
+      }
+      workStartedAtRef.current = 0
+      return
+    }
+    workStartedAtRef.current = Date.now()
+    longWorkRef.current = setInterval(() => {
+      setElapsedSec(Math.floor((Date.now() - workStartedAtRef.current) / 1000))
+    }, 500)
+    return () => {
+      if (longWorkRef.current) {
+        clearInterval(longWorkRef.current)
+        longWorkRef.current = null
+      }
+    }
+  }, [workInProgress])
 
   async function run() {
     if (!videoFile) return
-    setStatus('loading_ffmpeg')
-    setLog('')
+    setStatus('preparing')
+    setProgress(0)
+    setLastError('')
     setStats(null)
+    setStatusHint('Opening video with the browser decoder (usually a few seconds)…')
 
     try {
-      const ff = await getFFmpeg(addLog)
-      setStatus('extracting')
-
+      const caps = SAMPLE_CAPS[mode] || SAMPLE_CAPS.medium
       const fps = SAMPLING_MODES[mode].fps
-      await ff.writeFile('input.mp4', await fetchFile(videoFile))
 
-      // Extract frames as JPEG
-      await ff.exec([
-        '-i', 'input.mp4',
-        '-vf', `fps=${fps}`,
-        '-q:v', '2',
-        'frame_%04d.jpg',
-      ])
+      setStatus('extracting')
+      setStatusHint(
+        `Sampling up to ${caps.maxFrames} frames at ${fps} fps, then discarding blurry ones (Laplacian variance).`,
+      )
 
-      // Collect extracted frame files
-      const files = await ff.listDir('/')
-      const frameFiles = files.filter((f) => f.name.startsWith('frame_') && f.name.endsWith('.jpg'))
-      frameFiles.sort((a, b) => a.name.localeCompare(b.name))
-
-      setProgress(10)
-
-      // Quality filter
-      setStatus('filtering')
-      const accepted = []
-      const rejected = []
-
-      for (let i = 0; i < frameFiles.length; i++) {
-        const frameData = await ff.readFile(frameFiles[i].name)
-        const blob = new Blob([frameData], { type: 'image/jpeg' })
-        const imgData = await getImageData(blob)
-        const sharp = isSharp(imgData, blurThreshold)
-
-        if (sharp) {
-          accepted.push({ name: frameFiles[i].name, blob, dataUrl: URL.createObjectURL(blob) })
-        } else {
-          rejected.push(frameFiles[i].name)
-        }
-
-        setProgress(10 + Math.round((i / frameFiles.length) * 85))
-      }
+      const { total, accepted, rejected } = await sampleFramesFromVideo(videoFile, {
+        fps,
+        maxFrames: caps.maxFrames,
+        maxWidth: caps.maxWidth,
+        blurThreshold,
+        onProgress: setProgress,
+      })
 
       setProgress(100)
+      if (total > 0 && accepted.length === 0) {
+        setStatusHint(
+          'Every sampled frame looked blurry at this threshold. Lower “Blur Threshold” or pick Sparse, then run Extract again.',
+        )
+      } else {
+        setStatusHint('')
+      }
+
       setStats({
-        total: frameFiles.length,
+        total,
         accepted: accepted.length,
-        rejected: rejected.length,
+        rejected,
         mode,
         fps,
       })
       setStatus('done')
       onFramesReady?.(accepted)
-
-      // Cleanup
-      for (const f of frameFiles) {
-        await ff.deleteFile(f.name).catch(() => {})
-      }
-      await ff.deleteFile('input.mp4').catch(() => {})
     } catch (err) {
       console.error(err)
-      addLog(`ERROR: ${err.message}`)
+      setStatusHint('')
+      setLastError(err?.message || String(err))
       setStatus('error')
     }
   }
@@ -197,16 +306,29 @@ export default function FrameExtractor({ videoFile, onFramesReady }) {
 
       {status !== 'idle' && (
         <div className="bg-gray-800 rounded-xl p-3 space-y-2">
-          <div className="flex justify-between text-sm">
-            <span className="text-gray-400 capitalize">{status.replace('_', ' ')}</span>
-            <span className="text-violet-400">{progress}%</span>
+          <div className="flex justify-between text-sm gap-2">
+            <span className={`capitalize ${status === 'error' ? 'text-red-400' : 'text-gray-400'}`}>
+              {status.replaceAll('_', ' ')}
+            </span>
+            <span className="text-violet-400 shrink-0 tabular-nums">
+              {progress}%
+              {workInProgress && (
+                <span className="text-gray-500 font-normal ml-2">{elapsedSec}s</span>
+              )}
+            </span>
           </div>
           <div className="w-full bg-gray-700 rounded-full h-2">
             <div
-              className="bg-violet-500 h-2 rounded-full transition-all duration-300"
+              className={`h-2 rounded-full transition-all duration-300 ${status === 'error' ? 'bg-red-500' : 'bg-violet-500'}`}
               style={{ width: `${progress}%` }}
             />
           </div>
+          {statusHint && status !== 'error' && (
+            <p className="text-xs text-gray-500 leading-relaxed">{statusHint}</p>
+          )}
+          {status === 'error' && lastError && (
+            <p className="text-xs text-red-300/90 whitespace-pre-wrap break-words">{lastError}</p>
+          )}
         </div>
       )}
 
@@ -214,7 +336,7 @@ export default function FrameExtractor({ videoFile, onFramesReady }) {
         <div className="grid grid-cols-3 gap-2 text-center">
           <div className="bg-gray-800 rounded-lg p-3">
             <p className="text-2xl font-bold text-white">{stats.total}</p>
-            <p className="text-xs text-gray-500">Total frames</p>
+            <p className="text-xs text-gray-500">Sampled frames</p>
           </div>
           <div className="bg-emerald-900/30 border border-emerald-800/50 rounded-lg p-3">
             <p className="text-2xl font-bold text-emerald-400">{stats.accepted}</p>
@@ -229,12 +351,11 @@ export default function FrameExtractor({ videoFile, onFramesReady }) {
 
       <button
         onClick={run}
-        disabled={!videoFile || status === 'loading_ffmpeg' || status === 'extracting' || status === 'filtering'}
+        disabled={!videoFile || workInProgress}
         className="w-full bg-violet-600 hover:bg-violet-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium py-3 rounded-xl transition-colors"
       >
-        {status === 'loading_ffmpeg' ? 'Loading ffmpeg.wasm…'
-          : status === 'extracting' ? 'Extracting frames…'
-          : status === 'filtering' ? 'Filtering blurry frames…'
+        {status === 'preparing' ? 'Opening video…'
+          : status === 'extracting' ? 'Sampling frames…'
           : 'Extract Frames'}
       </button>
     </div>
